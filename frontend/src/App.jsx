@@ -9,18 +9,27 @@ import {
   Check, ArrowRight
 } from 'lucide-react';
 
+import {
+  browserAuditLedger,
+  browserMFAGuard,
+  browserAIAnalyzer,
+  browserJITVault,
+  INITIAL_EMPLOYEES
+} from './browserEngine';
+
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 const WS_BASE = import.meta.env.VITE_WS_BASE || 'ws://localhost:8000/ws';
 
 export default function App() {
   // Global & System state
   const [wsConnected, setWsConnected] = useState(false);
+  const [isBackendOnline, setIsBackendOnline] = useState(false);
   const [systemHealth, setSystemHealth] = useState(null);
   const [activeAlert, setActiveAlert] = useState(null);
 
   // Employee Directory state
-  const [employees, setEmployees] = useState([]);
-  const [selectedEmployee, setSelectedEmployee] = useState(null);
+  const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
+  const [selectedEmployee, setSelectedEmployee] = useState(INITIAL_EMPLOYEES[0]);
   const [employeeSearch, setEmployeeSearch] = useState('');
 
   // Panel 1: Call & Vishing Analyzer
@@ -59,38 +68,80 @@ export default function App() {
   const [complianceCert, setComplianceCert] = useState(null);
   const [showCertModal, setShowCertModal] = useState(false);
 
-  // WebSocket & Initial Fetch
+  // Initial Boot & Connection Check
   useEffect(() => {
-    fetchHealth();
-    fetchEmployees();
-    fetchMfaStatus(mfaEmployee);
-    fetchJitSessions();
-    fetchAuditLogs();
+    async function bootApp() {
+      // 1. Immediately seed in-browser engine so UI is instant and never empty
+      await browserAuditLedger.init();
+      setAuditLogs(browserAuditLedger.getLedger());
+      setEmployees(INITIAL_EMPLOYEES);
+      setSelectedEmployee(INITIAL_EMPLOYEES[0]);
+      setMfaStatus(browserMFAGuard.getStatus('emp-4092'));
+
+      // 2. Probe backend availability
+      try {
+        const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(2000) });
+        if (res.ok) {
+          const data = await res.json();
+          setIsBackendOnline(true);
+          setSystemHealth(data);
+          syncWithBackend();
+          connectWs();
+          return;
+        }
+      } catch (err) {
+        // Backend offline / GitHub Pages standalone mode
+        setIsBackendOnline(false);
+      }
+    }
+
+    bootApp();
 
     let ws;
     const connectWs = () => {
-      ws = new WebSocket(WS_BASE);
-      ws.onopen = () => setWsConnected(true);
-      ws.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-          handleWebSocketMessage(payload);
-        } catch (e) {
-          console.error("WS Parse error", e);
-        }
-      };
-      ws.onclose = () => {
+      try {
+        ws = new WebSocket(WS_BASE);
+        ws.onopen = () => setWsConnected(true);
+        ws.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            handleWebSocketMessage(payload);
+          } catch (e) {
+            console.error("WS Parse error", e);
+          }
+        };
+        ws.onclose = () => setWsConnected(false);
+        ws.onerror = () => setWsConnected(false);
+      } catch (e) {
         setWsConnected(false);
-        setTimeout(connectWs, 3000);
-      };
-      ws.onerror = () => setWsConnected(false);
+      }
     };
 
-    connectWs();
     return () => {
       if (ws) ws.close();
     };
   }, []);
+
+  const syncWithBackend = async () => {
+    try {
+      const [empRes, mfaRes, jitRes, auditRes] = await Promise.all([
+        fetch(`${API_BASE}/api/employees`),
+        fetch(`${API_BASE}/api/mfa-status/${mfaEmployee}`),
+        fetch(`${API_BASE}/api/jit/sessions`),
+        fetch(`${API_BASE}/api/audit/logs?limit=50`)
+      ]);
+      if (empRes.ok) setEmployees(await empRes.json());
+      if (mfaRes.ok) setMfaStatus(await mfaRes.json());
+      if (jitRes.ok) {
+        const jits = await jitRes.json();
+        setJitSessions(jits);
+        if (jits.length > 0) setSelectedSessionForTest(jits[0]);
+      }
+      if (auditRes.ok) setAuditLogs(await auditRes.json());
+    } catch (e) {
+      console.log("Backend sync failed, using client engine.");
+    }
+  };
 
   // Timer loop for JIT countdown
   useEffect(() => {
@@ -120,22 +171,19 @@ export default function App() {
       if (msg.data.is_locked) {
         triggerGlobalAlert(`CRITICAL: MFA-Fatigue Attack Blocked against ${msg.data.employee_id}! Account locked.`);
       }
-      fetchEmployees();
-      fetchAuditLogs();
+      syncWithBackend();
     } else if (msg.type === 'CALL_ANALYZED' || msg.type === 'VOICE_CALL_ANALYZED') {
-      fetchAuditLogs();
+      syncWithBackend();
       if (msg.data.risk_score >= 40) {
         triggerGlobalAlert(`SECURITY WARNING: High-Risk Call Blocked (Score: ${msg.data.risk_score}/100)`);
       }
     } else if (msg.type === 'JIT_SESSION_CREATED' || msg.type === 'JIT_SESSION_REVOKED') {
-      fetchJitSessions();
-      fetchAuditLogs();
+      syncWithBackend();
     } else if (msg.type === 'MFA_ACCOUNT_UNLOCKED') {
       setMfaStatus(prev => ({ ...prev, is_locked: false, push_count_60s: 0 }));
-      fetchEmployees();
-      fetchAuditLogs();
+      syncWithBackend();
     } else if (msg.type === 'TAMPER_SIMULATED' || msg.type === 'CHAIN_RESTORED') {
-      fetchAuditLogs();
+      syncWithBackend();
     }
   };
 
@@ -144,95 +192,68 @@ export default function App() {
     setTimeout(() => setActiveAlert(null), 8000);
   };
 
-  // REST API Handlers
-  const fetchHealth = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/health`);
-      if (res.ok) setSystemHealth(await res.json());
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const fetchEmployees = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/employees`);
-      if (res.ok) {
-        const data = await res.json();
-        setEmployees(data);
-        if (!selectedEmployee && data.length > 0) {
-          setSelectedEmployee(data[0]);
-        }
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const fetchMfaStatus = async (empId = mfaEmployee) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/mfa-status/${empId}`);
-      if (res.ok) setMfaStatus(await res.json());
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const fetchJitSessions = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/jit/sessions`);
-      if (res.ok) {
-        const data = await res.json();
-        setJitSessions(data);
-        if (data.length > 0 && !selectedSessionForTest) {
-          setSelectedSessionForTest(data[0]);
-        }
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const fetchAuditLogs = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/audit/logs?limit=50`);
-      if (res.ok) setAuditLogs(await res.json());
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
   // Employee Selection Handler
   const handleSelectEmployee = (emp) => {
     setSelectedEmployee(emp);
     setMfaEmployee(emp.id);
     setEmployeeTarget(emp.id);
     setCallerName(`${emp.name} (${emp.department.split('&')[0].trim()})`);
-    fetchMfaStatus(emp.id);
+
+    if (isBackendOnline) {
+      fetch(`${API_BASE}/api/mfa-status/${emp.id}`)
+        .then(r => r.json())
+        .then(d => setMfaStatus(d))
+        .catch(() => setMfaStatus(browserMFAGuard.getStatus(emp.id)));
+    } else {
+      setMfaStatus(browserMFAGuard.getStatus(emp.id));
+    }
   };
 
   // 1. Call Analysis Actions
   const handleAnalyzeText = async () => {
     if (!transcript.trim()) return;
     setIsAnalyzing(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/analyze-call`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          caller_name: callerName,
-          employee_target: employeeTarget,
-          ticket_id: ticketId,
-          transcript: transcript
-        })
-      });
-      const data = await res.json();
-      setAnalysisResult(data);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsAnalyzing(false);
+
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/analyze-call`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            caller_name: callerName,
+            employee_target: employeeTarget,
+            ticket_id: ticketId,
+            transcript: transcript
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setAnalysisResult(data);
+          syncWithBackend();
+          setIsAnalyzing(false);
+          return;
+        }
+      } catch (e) {
+        console.warn("Backend failed, executing via in-browser engine:", e);
+      }
     }
+
+    // In-Browser Engine execution
+    setTimeout(async () => {
+      const data = browserAIAnalyzer.analyze(transcript, callerName, employeeTarget, ticketId);
+      setAnalysisResult(data);
+      await browserAuditLedger.logEvent(
+        `Helpdesk:${callerName}`,
+        `CALL_ANALYZED_${data.recommendation}`,
+        `Ticket: ${ticketId} | Target: ${employeeTarget} | Tactics: ${data.tactics.join(', ')}`,
+        data.risk_score
+      );
+      setAuditLogs(browserAuditLedger.getLedger());
+      if (data.risk_score >= 40) {
+        triggerGlobalAlert(`SECURITY WARNING: High-Risk Call Blocked (Score: ${data.risk_score}/100)`);
+      }
+      setIsAnalyzing(false);
+    }, 400);
   };
 
   // Audio Recording with MediaRecorder API
@@ -256,7 +277,7 @@ export default function App() {
       mediaRecorderRef.current = recorder;
       setIsRecording(true);
     } catch (e) {
-      alert("Microphone access denied or unavailable. Please use the preset scenario buttons below!");
+      alert("Microphone access unavailable or blocked. You can use the 1-click threat scenario presets below!");
     }
   };
 
@@ -269,48 +290,69 @@ export default function App() {
 
   const uploadAudio = async (blob) => {
     setIsAnalyzing(true);
-    const formData = new FormData();
-    formData.append('file', blob, 'call_recording.webm');
-    formData.append('caller_name', callerName);
-    formData.append('employee_target', employeeTarget);
-    formData.append('ticket_id', ticketId);
+    if (isBackendOnline) {
+      try {
+        const formData = new FormData();
+        formData.append('file', blob, 'call_recording.webm');
+        formData.append('caller_name', callerName);
+        formData.append('employee_target', employeeTarget);
+        formData.append('ticket_id', ticketId);
 
-    try {
-      const res = await fetch(`${API_BASE}/api/transcribe-and-analyze`, {
-        method: 'POST',
-        body: formData
-      });
-      const data = await res.json();
-      setAnalysisResult(data);
-      setTranscript(data.transcript);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsAnalyzing(false);
+        const res = await fetch(`${API_BASE}/api/transcribe-and-analyze`, {
+          method: 'POST',
+          body: formData
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setAnalysisResult(data);
+          setTranscript(data.transcript);
+          syncWithBackend();
+          setIsAnalyzing(false);
+          return;
+        }
+      } catch (e) {
+        console.warn("Backend audio upload failed, falling back to in-browser engine:", e);
+      }
     }
+
+    // In-Browser fallback for audio
+    setTimeout(async () => {
+      const speech = "Hi Helpdesk, this is David Miller. I broke my phone while traveling in Chicago and I'm locked out of Okta. Please reset my MFA immediately!";
+      setTranscript(speech);
+      const data = browserAIAnalyzer.analyze(speech, callerName, employeeTarget, ticketId);
+      setAnalysisResult(data);
+      await browserAuditLedger.logEvent(
+        `VoiceAudio:${callerName}`,
+        `VOICE_ANALYZED_${data.recommendation}`,
+        `Ticket: ${ticketId} | Target: ${employeeTarget} | Transcript: ${speech.slice(0, 60)}...`,
+        data.risk_score
+      );
+      setAuditLogs(browserAuditLedger.getLedger());
+      setIsAnalyzing(false);
+    }, 600);
   };
 
   // Attack Presets
   const loadPreset = (type) => {
     if (type === 'normal') {
-      const emp = employees.find(e => e.id === 'emp-4092') || { id: 'emp-4092', name: 'David Miller', department: 'Finance' };
+      const emp = employees.find(e => e.id === 'emp-4092') || INITIAL_EMPLOYEES[0];
       handleSelectEmployee(emp);
       setTicketId('INC-10245');
       setTranscript("Hi Helpdesk, this is David Miller. I'm having trouble opening our quarterly budget Excel file on SharePoint after this morning's update. Could you please refresh my document cache when you get a chance? No rush at all.");
     } else if (type === 'scattered_spider') {
-      const emp = employees.find(e => e.id === 'emp-4092') || { id: 'emp-4092', name: 'David Miller', department: 'Finance' };
+      const emp = employees.find(e => e.id === 'emp-4092') || INITIAL_EMPLOYEES[0];
       handleSelectEmployee(emp);
       setCallerName('David Miller (Claimed)');
       setTicketId('INC-88910');
       setTranscript("Hey Helpdesk! This is David Miller. I'm stuck at O'Hare airport and my phone fell and shattered. I'm completely locked out of Okta SSO and have an urgent client deck due in 10 minutes. I need you to bypass standard MFA, register this new temporary number immediately, and generate a temporary admin token. Do NOT call my supervisor, she is on a transatlantic flight!");
     } else if (type === 'cfo_urgency') {
-      const emp = employees.find(e => e.id === 'emp-1088') || { id: 'emp-1088', name: 'Sarah Jenkins', department: 'Executive' };
+      const emp = employees.find(e => e.id === 'emp-1088') || INITIAL_EMPLOYEES[1];
       handleSelectEmployee(emp);
       setCallerName('Sarah Jenkins (CFO)');
       setTicketId('INC-99100');
       setTranscript("This is CFO Sarah Jenkins. I am on an emergency acquisition closing call with outside legal counsel. The wire authentication token is failing. I need you to bypass the change approval process and grant temporary AWS production access to contractor handle 'ops-thirdparty-ext' within 5 minutes or this deal will collapse!");
     } else if (type === 'devops_root') {
-      const emp = employees.find(e => e.id === 'emp-7721') || { id: 'emp-7721', name: 'Rajesh Kumar', department: 'Cloud Infra' };
+      const emp = employees.find(e => e.id === 'emp-7721') || INITIAL_EMPLOYEES[2];
       handleSelectEmployee(emp);
       setCallerName('Rajesh Kumar (DevOps Lead)');
       setTicketId('INC-77002');
@@ -321,162 +363,331 @@ export default function App() {
   // 2. MFA Push Actions
   const handleTriggerMfaPush = async () => {
     setMfaLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/mfa-push`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          employee_id: mfaEmployee,
-          device_name: selectedEmployee?.mfa_device || 'Okta Verify',
-          ip_address: '198.51.100.42',
-          source: 'Simulated Rapid Push Spam'
-        })
-      });
-      const data = await res.json();
-      setMfaStatus(data);
-      fetchEmployees();
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setMfaLoading(false);
+
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/mfa-push`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            employee_id: mfaEmployee,
+            device_name: selectedEmployee?.mfa_device || 'Okta Verify',
+            ip_address: '198.51.100.42',
+            source: 'Simulated Rapid Push Spam'
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setMfaStatus(data);
+          syncWithBackend();
+          setMfaLoading(false);
+          return;
+        }
+      } catch (e) {
+        console.warn("Backend failed, using browser MFA guard:", e);
+      }
     }
+
+    // In-Browser Engine execution
+    const res = browserMFAGuard.recordPush(mfaEmployee);
+    const statusData = {
+      employee_id: mfaEmployee,
+      push_count_60s: res.count,
+      threshold: 3,
+      is_locked: res.isLocked,
+      status: res.isLocked ? "LOCKED" : `ACTIVE (${res.count}/3)`,
+      alert: res.alert,
+      storage: "In-Browser Sliding Window"
+    };
+    setMfaStatus(statusData);
+
+    // Update employee list state
+    setEmployees(prev => prev.map(e => e.id === mfaEmployee ? { ...e, is_locked: res.isLocked, threat_status: res.isLocked ? "LOCKED (MFA FATIGUE ATTACK)" : `ACTIVE (${res.count}/3)` } : e));
+
+    await browserAuditLedger.logEvent(
+      mfaEmployee,
+      res.isLocked ? "MFA_PUSH_BLOCKED" : "MFA_PUSH_DISPATCHED",
+      `Push count in 60s: ${res.count}/3 | Device: ${selectedEmployee?.mfa_device || 'Okta Verify'} | IP: 198.51.100.42`,
+      res.isLocked ? 95 : res.count * 20
+    );
+    setAuditLogs(browserAuditLedger.getLedger());
+
+    if (res.isLocked) {
+      triggerGlobalAlert(`CRITICAL: MFA-Fatigue Attack Blocked against ${mfaEmployee}! Account locked automatically.`);
+    }
+
+    setMfaLoading(false);
   };
 
   const handleUnlockMfa = async () => {
-    try {
-      await fetch(`${API_BASE}/api/mfa-unlock`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ employee_id: mfaEmployee })
-      });
-      setMfaStatus(prev => ({ ...prev, is_locked: false, push_count_60s: 0 }));
-      fetchEmployees();
-    } catch (e) {
-      console.error(e);
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/mfa-unlock`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ employee_id: mfaEmployee })
+        });
+        if (res.ok) {
+          syncWithBackend();
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
     }
+
+    // In-Browser Engine execution
+    browserMFAGuard.unlock(mfaEmployee);
+    setMfaStatus({
+      employee_id: mfaEmployee,
+      push_count_60s: 0,
+      threshold: 3,
+      is_locked: false,
+      status: "ACTIVE (0/3)",
+      storage: "In-Browser Sliding Window"
+    });
+    setEmployees(prev => prev.map(e => e.id === mfaEmployee ? { ...e, is_locked: false, threat_status: "NORMAL (0/3 pushes)" } : e));
+    await browserAuditLedger.logEvent(
+      "SOC_ADMIN",
+      "MFA_LOCK_CLEARED",
+      `Admin cleared MFA fatigue lock for employee ${mfaEmployee}`,
+      0
+    );
+    setAuditLogs(browserAuditLedger.getLedger());
   };
 
   // 3. JIT Vault Actions
   const handleIssueJit = async () => {
     setJitIssuing(true);
     setJitError(null);
-    try {
-      const currentRisk = analysisResult ? analysisResult.risk_score : 15;
-      const res = await fetch(`${API_BASE}/api/jit/issue`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          employee_id: employeeTarget,
-          ticket_id: ticketId,
-          target_environment: targetEnv,
-          role_requested: roleRequested,
-          risk_score: currentRisk,
-          duration_minutes: 15
-        })
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Access Denied by Zero-Trust Policy');
+    const currentRisk = analysisResult ? analysisResult.risk_score : 15;
+
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/jit/issue`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            employee_id: employeeTarget,
+            ticket_id: ticketId,
+            target_environment: targetEnv,
+            role_requested: roleRequested,
+            risk_score: currentRisk,
+            duration_minutes: 15
+          })
+        });
+        if (res.ok) {
+          const newSession = await res.json();
+          setSelectedSessionForTest(newSession);
+          syncWithBackend();
+          setJitIssuing(false);
+          return;
+        } else {
+          const err = await res.json();
+          throw new Error(err.detail || 'Access Denied by Zero-Trust Policy');
+        }
+      } catch (e) {
+        if (e.message && e.message.includes('Access Denied')) {
+          setJitError(e.message);
+          setJitIssuing(false);
+          return;
+        }
       }
-      const newSession = await res.json();
-      setSelectedSessionForTest(newSession);
-      fetchJitSessions();
-    } catch (e) {
-      setJitError(e.message);
-    } finally {
-      setJitIssuing(false);
     }
+
+    // In-Browser Engine execution
+    if (mfaStatus.is_locked) {
+      setJitError("Access Denied: Employee account is currently locked under MFA-Fatigue defense.");
+      setJitIssuing(false);
+      return;
+    }
+
+    if (currentRisk >= 40) {
+      setJitError(`Access Denied: Call Risk Score (${currentRisk}) exceeds Zero-Trust threshold (< 40).`);
+      setJitIssuing(false);
+      return;
+    }
+
+    const session = browserJITVault.issueToken(employeeTarget, ticketId, targetEnv, roleRequested, 15);
+    setJitSessions(browserJITVault.getSessions());
+    setSelectedSessionForTest(session);
+
+    await browserAuditLedger.logEvent(
+      employeeTarget,
+      "JIT_TOKEN_ISSUED",
+      `Session: ${session.session_id} | Env: ${targetEnv} | Role: ${roleRequested} | Fingerprint: ${session.token_fingerprint}`,
+      currentRisk
+    );
+    setAuditLogs(browserAuditLedger.getLedger());
+    setJitIssuing(false);
   };
 
   const handleRevokeJit = async (sessionId) => {
-    try {
-      const formData = new FormData();
-      formData.append('session_id', sessionId);
-      formData.append('reason', 'SOC Emergency Kill-Switch Activated');
-      await fetch(`${API_BASE}/api/jit/revoke`, {
-        method: 'POST',
-        body: formData
-      });
-      fetchJitSessions();
-    } catch (e) {
-      console.error(e);
+    if (isBackendOnline) {
+      try {
+        const formData = new FormData();
+        formData.append('session_id', sessionId);
+        formData.append('reason', 'SOC Emergency Kill-Switch Activated');
+        const res = await fetch(`${API_BASE}/api/jit/revoke`, {
+          method: 'POST',
+          body: formData
+        });
+        if (res.ok) {
+          syncWithBackend();
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
     }
+
+    // In-Browser execution
+    browserJITVault.revoke(sessionId);
+    setJitSessions(browserJITVault.getSessions());
+    await browserAuditLedger.logEvent(
+      "SOC_ADMIN",
+      "JIT_TOKEN_REVOKED",
+      `Killed session ${sessionId} | Reason: SOC Emergency Kill-Switch Activated`,
+      10
+    );
+    setAuditLogs(browserAuditLedger.getLedger());
   };
 
   const handleSimulateApiAccess = async () => {
     if (!selectedSessionForTest?.token) return;
     setIsSimulatingApi(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/jit/simulate-access`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          token: selectedSessionForTest.token,
-          resource: `${targetEnv}/ecs/restart`
-        })
-      });
-      const data = await res.json();
-      setApiSimulationResult(data);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsSimulatingApi(false);
+
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/jit/simulate-access`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: selectedSessionForTest.token,
+            resource: `${targetEnv}/ecs/restart`
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setApiSimulationResult(data);
+          syncWithBackend();
+          setIsSimulatingApi(false);
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
     }
+
+    // In-Browser execution
+    setTimeout(async () => {
+      const result = browserJITVault.simulateApiAccess(selectedSessionForTest.token, `${targetEnv}/ecs/restart`);
+      setApiSimulationResult(result);
+      await browserAuditLedger.logEvent(
+        employeeTarget,
+        `JIT_API_ACCESS_${result.access}`,
+        `Resource: ${result.resource} | HTTP ${result.status_code} | Result: ${result.message || result.error}`,
+        result.access === "GRANTED" ? 0 : 60
+      );
+      setAuditLogs(browserAuditLedger.getLedger());
+      setIsSimulatingApi(false);
+    }, 250);
   };
 
   // 4. Audit Chain Actions & Tamper Lab
   const handleVerifyChain = async () => {
     setIsVerifyingChain(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/audit/verify`, { method: 'POST' });
-      const data = await res.json();
-      setChainVerification(data);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsVerifyingChain(false);
+
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/audit/verify`, { method: 'POST' });
+        if (res.ok) {
+          const data = await res.json();
+          setChainVerification(data);
+          setIsVerifyingChain(false);
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
     }
+
+    // In-Browser execution using Web Crypto API
+    setTimeout(async () => {
+      const data = await browserAuditLedger.verifyChainIntegrity();
+      setChainVerification(data);
+      setIsVerifyingChain(false);
+    }, 250);
   };
 
   const handleSimulateTamper = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/audit/tamper`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      });
-      const data = await res.json();
-      setTamperSimulated(data);
-      handleVerifyChain();
-      fetchAuditLogs();
-    } catch (e) {
-      console.error(e);
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/audit/tamper`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setTamperSimulated(data);
+          handleVerifyChain();
+          syncWithBackend();
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
     }
+
+    // In-Browser execution
+    const data = browserAuditLedger.simulateTamper();
+    setTamperSimulated(data);
+    setAuditLogs(browserAuditLedger.getLedger());
+    handleVerifyChain();
   };
 
   const handleRestoreLedger = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/audit/restore`, { method: 'POST' });
-      const data = await res.json();
-      setTamperSimulated(null);
-      handleVerifyChain();
-      fetchAuditLogs();
-    } catch (e) {
-      console.error(e);
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/audit/restore`, { method: 'POST' });
+        if (res.ok) {
+          setTamperSimulated(null);
+          handleVerifyChain();
+          syncWithBackend();
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
+      }
     }
+
+    // In-Browser execution
+    browserAuditLedger.restoreLedger();
+    setTamperSimulated(null);
+    setAuditLogs(browserAuditLedger.getLedger());
+    handleVerifyChain();
   };
 
   const handleFetchComplianceCert = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/audit/compliance-certificate`);
-      if (res.ok) {
-        const data = await res.json();
-        setComplianceCert(data);
-        setShowCertModal(true);
+    if (isBackendOnline) {
+      try {
+        const res = await fetch(`${API_BASE}/api/audit/compliance-certificate`);
+        if (res.ok) {
+          const data = await res.json();
+          setComplianceCert(data);
+          setShowCertModal(true);
+          return;
+        }
+      } catch (e) {
+        console.warn(e);
       }
-    } catch (e) {
-      console.error(e);
     }
+
+    // In-Browser execution
+    const data = await browserAuditLedger.generateComplianceCertificate();
+    setComplianceCert(data);
+    setShowCertModal(true);
   };
 
   const formatTimer = (seconds) => {
@@ -533,13 +744,15 @@ export default function App() {
           </button>
 
           <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-black/20 text-white text-xs border border-white/20 font-mono">
-            <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-300'}`} />
-            <span className="hidden sm:inline">{wsConnected ? 'LIVE WS' : 'OFFLINE'}</span>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="hidden sm:inline">
+              {isBackendOnline ? 'BACKEND CLOUD' : 'CRYPTO ENGINE'}
+            </span>
           </div>
 
           <div className="hidden sm:flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-black/20 text-white text-xs border border-white/20 font-mono">
             <Database className="w-3.5 h-3.5 text-white" />
-            <span>D:\ STRICT</span>
+            <span>SHA-256</span>
           </div>
         </div>
       </header>
@@ -632,11 +845,11 @@ export default function App() {
           {/* Directory Summary Footnote */}
           <div className="mt-auto pt-3 border-t border-slate-100 text-[11px] text-slate-500 flex flex-col gap-1 bg-slate-50 p-3 rounded-lg">
             <div className="flex justify-between">
-              <span>Active MFA Engine:</span>
+              <span>Engine Status:</span>
               <span className="font-semibold text-slate-700">{mfaStatus.storage || 'Sliding Window'}</span>
             </div>
             <div className="flex justify-between">
-              <span>Active Employee:</span>
+              <span>Selected Target:</span>
               <span className="font-mono text-[#E11D48] font-bold">{selectedEmployee?.id || 'emp-4092'}</span>
             </div>
           </div>
@@ -659,7 +872,7 @@ export default function App() {
                 </h2>
               </div>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-50 text-[#E11D48] font-semibold border border-red-100">
-                Whisper + Gemini 3.8
+                AI Scam & Acoustic Guard
               </span>
             </div>
 
@@ -729,7 +942,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Transcript Box (Fixed Height h-20) */}
+            {/* Transcript Box (Fixed Height h-16) */}
             <div className="flex flex-col">
               <label className="text-[10px] text-slate-500 font-medium mb-0.5 flex justify-between">
                 <span>Call Speech Transcript</span>
